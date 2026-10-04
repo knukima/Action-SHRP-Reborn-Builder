@@ -1,0 +1,179 @@
+name: SHRP Reborn Build
+
+on:
+  workflow_dispatch:
+    inputs:
+      MANIFEST_URL:
+        description: 'MANIFEST_URL'
+        required: true
+        default: 'https://github.com/SHRP-Reborn/manifest.git'
+      MANIFEST_BRANCH:
+        description: 'MANIFEST_BRANCH'
+        required: true
+        default: 'shrp-12.1'
+      DEVICE_TREE_URL:
+        description: 'DEVICE_TREE_URL (tree with SHRP flags in BoardConfig.mk)'
+        required: true
+        default: 'https://github.com/SHRP-Reborn/android_device_xiaomi_nabu'
+      DEVICE_TREE_BRANCH:
+        description: 'DEVICE_TREE_BRANCH'
+        required: true
+        default: 'android-12.1'
+      DEVICE_PATH:
+        description: 'DEVICE_PATH'
+        required: true
+        default: 'device/vendor/codename'
+      COMMON_TREE_URL:
+        description: 'COMMON_TREE_URL (if no common tree, leave blank)'
+        required: false
+      COMMON_TREE_BRANCH:
+        description: 'COMMON_TREE_BRANCH (if no common tree, leave blank)'
+        required: false
+      COMMON_PATH:
+        description: 'COMMON_PATH (if no common tree, leave blank)'
+        required: false
+      MAINTAINER_NAME:
+        description: 'MAINTAINER_NAME (spaces become underscores)'
+        required: true
+        default: 'yourname'
+      DEVICE_NAME:
+        description: 'DEVICE_NAME (codename)'
+        required: true
+        default: 'codename'
+      MAKEFILE_NAME:
+        description: 'MAKEFILE_NAME'
+        required: true
+        default: 'twrp_codename'
+      BUILD_TARGET:
+        description: 'BUILD_TARGET: recovery | boot | vendorboot'
+        required: true
+        default: 'recovery'
+
+jobs:
+  build:
+    if: github.event.repository.owner.id == github.event.sender.id
+    runs-on: ubuntu-22.04
+    permissions:
+      contents: write
+    env:
+      SRC_DIR: ${{ github.workspace }}/workspace/shrp_src
+      MANIFEST_URL: ${{ github.event.inputs.MANIFEST_URL }}
+      MANIFEST_BRANCH: ${{ github.event.inputs.MANIFEST_BRANCH }}
+      DEVICE_TREE_URL: ${{ github.event.inputs.DEVICE_TREE_URL }}
+      DEVICE_TREE_BRANCH: ${{ github.event.inputs.DEVICE_TREE_BRANCH }}
+      DEVICE_PATH: ${{ github.event.inputs.DEVICE_PATH }}
+      COMMON_TREE_URL: ${{ github.event.inputs.COMMON_TREE_URL }}
+      COMMON_TREE_BRANCH: ${{ github.event.inputs.COMMON_TREE_BRANCH }}
+      COMMON_PATH: ${{ github.event.inputs.COMMON_PATH }}
+      MAINTAINER_NAME: ${{ github.event.inputs.MAINTAINER_NAME }}
+      DEVICE_NAME: ${{ github.event.inputs.DEVICE_NAME }}
+      MAKEFILE_NAME: ${{ github.event.inputs.MAKEFILE_NAME }}
+      BUILD_TARGET: ${{ github.event.inputs.BUILD_TARGET }}
+    steps:
+
+    - name: Check Out
+      uses: actions/checkout@v4
+
+    - name: Cleanup
+      uses: rokibhasansagar/slimhub_actions@main
+
+    - name: Install OpenJDK
+      uses: actions/setup-java@v4
+      with:
+        distribution: 'zulu'
+        java-version: '11'
+
+    - name: Setup SSH Keys
+      if: ${{ startsWith(github.event.inputs.MANIFEST_URL, 'git@github.com') ||
+          startsWith(github.event.inputs.DEVICE_TREE_URL, 'git@github.com') ||
+          startsWith(github.event.inputs.COMMON_TREE_URL, 'git@github.com') }}
+      uses: webfactory/ssh-agent@v0.9.0
+      with:
+          ssh-private-key: |
+            ${{ secrets.SSH_PRIVATE_KEY }}
+
+    - name: Set Swap Space
+      uses: pierotofy/set-swap-space@master
+      with:
+        swap-size-gb: 12
+
+    - name: Prepare the build environment
+      run: |
+        sudo apt update && sudo apt upgrade -y
+        DEBIAN_FRONTEND=noninteractive sudo apt install -yq \
+            linux-modules-extra-$(uname -r) \
+            git python3 tar aria2 curl ccache
+
+        git clone https://gitlab.com/OrangeFox/misc/scripts "$RUNNER_TEMP/scripts"
+        sudo bash "$RUNNER_TEMP/scripts/setup/android_build_env.sh"
+
+        # Some Android 12.1 build scripts still call `python2.7`
+        sudo apt install -y python2 || true
+        if ! command -v python2.7 >/dev/null 2>&1; then
+          sudo ln -sf "$(command -v python3)" /usr/local/bin/python2.7
+        fi
+        python2.7 --version
+
+        mkdir -p ~/bin
+        curl -s https://storage.googleapis.com/git-repo-downloads/repo > ~/bin/repo
+        chmod a+x ~/bin/repo
+        echo "$HOME/bin" >> $GITHUB_PATH
+        git config --global user.name "github-actions"
+        git config --global user.email "github-actions@users.noreply.github.com"
+
+    - name: Sync sources and trees
+      run: |
+        export PATH="$HOME/bin:$PATH"
+        mkdir -p "$SRC_DIR"
+        cd "$SRC_DIR"
+
+        repo init -u "$MANIFEST_URL" -b "$MANIFEST_BRANCH" --depth=1
+        repo sync -c -j$(nproc --all) --force-sync --no-clone-bundle --no-tags
+
+        git clone "$DEVICE_TREE_URL" -b "$DEVICE_TREE_BRANCH" "./$DEVICE_PATH"
+
+        if [ -n "$COMMON_TREE_URL" ] && [ -n "$COMMON_PATH" ]; then
+          if [ -n "$COMMON_TREE_BRANCH" ]; then
+            git clone "$COMMON_TREE_URL" -b "$COMMON_TREE_BRANCH" "./$COMMON_PATH"
+          else
+            git clone "$COMMON_TREE_URL" "./$COMMON_PATH"
+          fi
+        fi
+
+        # SHRP flag values must not contain spaces or dashes
+        NAME=$(echo "$MAINTAINER_NAME" | sed 's/[ -]/_/g')
+        # Comment out existing definitions anywhere in the device tree
+        grep -rlE '^[[:space:]]*SHRP_MAINTAINER' "$DEVICE_PATH" --include='*.mk' \
+          | xargs -r sed -i -E 's/^([[:space:]]*)SHRP_MAINTAINER/\1#SHRP_MAINTAINER/'
+        # The last assignment wins, so append ours to BoardConfig.mk
+        printf '\n# Set by CI\nSHRP_MAINTAINER := %s\n' "$NAME" >> "$DEVICE_PATH/BoardConfig.mk"
+        grep -n 'SHRP_MAINTAINER' "$DEVICE_PATH/BoardConfig.mk"
+
+    - name: Building SHRP Reborn
+      run: |
+        cd "$SRC_DIR"
+        export ALLOW_MISSING_DEPENDENCIES=true
+        export USE_CCACHE=1
+        set +e
+        source build/envsetup.sh
+        set -e
+        lunch "${MAKEFILE_NAME}-eng"
+        mka "${BUILD_TARGET}image" -j$(nproc --all)
+        echo
+        ls -al "out/target/product/${DEVICE_NAME}/"
+
+    - name: Upload to Release
+      uses: softprops/action-gh-release@v2
+      with:
+        files: |
+          ${{ github.workspace }}/workspace/shrp_src/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.img
+          ${{ github.workspace }}/workspace/shrp_src/out/target/product/${{ github.event.inputs.DEVICE_NAME }}/*.zip
+        name: SHRP-${{ github.event.inputs.DEVICE_NAME }}-${{ github.run_id }}
+        tag_name: ${{ github.run_id }}
+        body: |
+          Manifest: ${{ github.event.inputs.MANIFEST_URL }} (${{ github.event.inputs.MANIFEST_BRANCH }})
+          Device: ${{ github.event.inputs.DEVICE_NAME }}
+          Maintainer: ${{ github.event.inputs.MAINTAINER_NAME }}
+          Target: ${{ github.event.inputs.BUILD_TARGET }}
+      env:
+        GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
